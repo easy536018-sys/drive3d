@@ -437,7 +437,7 @@ html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#87b7df;fon
   </div>
 </div>
 <div id="loading">3D 도시를 불러오는 중...</div>
-<div id="hud"><div id="playerNickname" style="font-size:16px;margin-bottom:4px"></div><div id="speed">0 km/h</div><div id="gear">D</div><div id="weapon">무기: 1 미사일</div><div id="hp">차량 내구도: 100</div><div id="coins">코인: 0</div></div>
+<div id="onlineStatus" style="position:fixed;z-index:6;left:18px;top:132px;color:#9ee493;text-shadow:0 2px 5px #000;font-weight:800;font-size:14px">서버 1: 연결 중...</div><div id="hud"><div id="playerNickname" style="font-size:16px;margin-bottom:4px"></div><div id="speed">0 km/h</div><div id="gear">D</div><div id="weapon">무기: 1 미사일</div><div id="hp">차량 내구도: 100</div><div id="coins">코인: 0</div></div>
 <div id="help">W/S 가속·브레이크<br>A/D 조향 · Space 드리프트<br>Shift: 부스터 (+60 km/h)<br>마우스 드래그: 카메라<br>1~4 무기 선택 · 충격파/망치: 좌클릭 꾹 누르기 차징 · 손 떼기 발사<br>R: 차량 리셋 · C: 카메라<br>적 차량: 5초마다 1대 추가 · 8종 디자인 · 최대 50대<br>적 차량 파괴: +10 코인<br>B: 상점 열기/닫기</div>
 <div id="shop">
   <div id="shopPanel">
@@ -2670,17 +2670,9 @@ function updateEnemyWeapons(dt){
     const toCar=car.position.clone().sub(e.position);toCar.y=0;
     const d=toCar.length();
     if(d<85)enemyFire(e);
-    if(d<3.8 && Math.abs(state.speed)>5){
+    if(d<4.2 && Math.abs(state.speed)>5){
       damagePlayer(18);
-
-      // 서로 부딪히면 플레이어와 적 차량 모두 속도가 감소한다.
-      // 충돌 순간 속도의 55%만 유지해 강하게 튕겨나가지 않고 감속하도록 처리.
-      state.speed *= 0.45;
-      e.userData.speed *= 0.45;
-
-      // 겹침만 살짝 해소한다.
-      const pushDir=toCar.lengthSq()>0.001 ? toCar.normalize() : new THREE.Vector3(0,0,1);
-      e.position.addScaledVector(pushDir,-0.35);
+      e.position.addScaledVector(toCar.normalize(),-3);
     }
   }
   for(let i=enemyShots.length-1;i>=0;i--){
@@ -2920,6 +2912,8 @@ function loop(now){
     update(dt);updateEngineSound();updateWeapons(dt);updateEnemyWeapons(dt);updateSmoke(dt);updateHammerAttackAnimation(dt);
   updateHammerKnockback(dt);
   updateWeaponEffects(dt);updateBoostEffect();updateMountedWeapon();updateCamera(dt);
+  updateRemotePlayers(dt);
+  sendOnlineState(now);
   }
   renderer.render(scene,camera);requestAnimationFrame(loop);
 }
@@ -3108,6 +3102,197 @@ document.getElementById('selectCarConfirm').addEventListener('click',()=>{
 setPlayerCarType(selectedCarType);
 initCarPreview();
 
+
+// ===== 온라인 멀티플레이어: 서버 1 =====
+// GitHub Pages에서 플레이할 때는 아래 주소를 Render 서버 주소로 바꾸면 된다.
+// Render에서 이 게임을 함께 서비스하면 같은 주소를 자동으로 사용한다.
+const ONLINE_SERVER_URL = 'AUTO';
+
+const onlinePlayers = new Map();
+let onlineSocket = null;
+let onlinePlayerId = null;
+let onlineLastSend = 0;
+let onlineConnected = false;
+
+function getOnlineSocketUrl(){
+  if(ONLINE_SERVER_URL !== 'AUTO') return ONLINE_SERVER_URL;
+  if(location.protocol === 'https:') return 'wss://' + location.host;
+  if(location.protocol === 'http:') return 'ws://' + location.host;
+  return '';
+}
+
+function onlineStatus(text, ok=false){
+  const el=document.getElementById('onlineStatus');
+  if(el){
+    el.textContent='서버 1: '+text;
+    el.style.color=ok?'#9ee493':'#ffd54a';
+  }
+}
+
+function createRemotePlayer(data){
+  const type=enemyByName[data.carType] || enemyTypes[0];
+  const model=createEnemy(type,false);
+  model.userData.isRemotePlayer=true;
+  model.userData.remoteId=data.id;
+
+  // NPC용 무기는 제거하고 플레이어 차량 형태만 사용한다.
+  const remoteName=new THREE.Sprite(new THREE.SpriteMaterial({
+    map:makeNameTexture(data.nickname || '플레이어','#ffffff'),
+    transparent:true,
+    depthTest:false
+  }));
+  remoteName.position.set(0,2.55,0);
+  remoteName.scale.set(3.8,.95,1);
+  remoteName.renderOrder=20;
+  model.add(remoteName);
+
+  model.position.set(data.x||0,ROAD_Y,data.z||0);
+  model.rotation.y=data.ry||0;
+  scene.add(model);
+
+  return {
+    model,
+    targetX:data.x||0,
+    targetZ:data.z||0,
+    targetRY:data.ry||0,
+    nickname:data.nickname||'플레이어',
+    carType:data.carType||type.name
+  };
+}
+
+function removeRemotePlayer(id){
+  const p=onlinePlayers.get(id);
+  if(!p)return;
+  if(p.model.parent)p.model.parent.remove(p.model);
+  p.model.traverse(o=>{
+    if(o.material?.map?.isCanvasTexture)o.material.map.dispose();
+    if(o.material?.dispose)o.material.dispose();
+  });
+  onlinePlayers.delete(id);
+}
+
+function updateRemotePlayers(dt){
+  for(const [id,p] of onlinePlayers){
+    p.model.position.x += (p.targetX-p.model.position.x)*Math.min(1,dt*12);
+    p.model.position.z += (p.targetZ-p.model.position.z)*Math.min(1,dt*12);
+
+    let diff=Math.atan2(
+      Math.sin(p.targetRY-p.model.rotation.y),
+      Math.cos(p.targetRY-p.model.rotation.y)
+    );
+    p.model.rotation.y += diff*Math.min(1,dt*12);
+  }
+}
+
+function sendOnlineState(now){
+  if(!onlineConnected || !onlineSocket || onlineSocket.readyState!==WebSocket.OPEN || !gameStarted)return;
+  if(now-onlineLastSend<50)return; // 20회/초
+  onlineLastSend=now;
+
+  onlineSocket.send(JSON.stringify({
+    type:'state',
+    x:Number(car.position.x.toFixed(3)),
+    z:Number(car.position.z.toFixed(3)),
+    ry:Number(car.rotation.y.toFixed(4)),
+    speed:Number(state.speed.toFixed(2)),
+    carType:selectedCarType,
+    nickname:(nicknameInput.value||'플레이어').trim().slice(0,16)||'플레이어'
+  }));
+}
+
+function connectOnlineServer(){
+  const url=getOnlineSocketUrl();
+  if(!url){
+    onlineStatus('서버 주소 필요');
+    return;
+  }
+
+  try{
+    onlineSocket=new WebSocket(url);
+  }catch(err){
+    onlineStatus('연결 실패');
+    return;
+  }
+
+  onlineSocket.addEventListener('open',()=>{
+    onlineConnected=true;
+    onlineStatus('접속됨 · 0명',true);
+
+    const nickname=(nicknameInput.value||'플레이어').trim().slice(0,16)||'플레이어';
+    onlineSocket.send(JSON.stringify({
+      type:'join',
+      room:'server-1',
+      nickname,
+      carType:selectedCarType,
+      x:car.position.x,
+      z:car.position.z,
+      ry:car.rotation.y
+    }));
+  });
+
+  onlineSocket.addEventListener('message',e=>{
+    let msg;
+    try{ msg=JSON.parse(e.data); }catch{return;}
+
+    if(msg.type==='welcome'){
+      onlinePlayerId=msg.id;
+      onlineStatus('접속됨 · '+msg.count+'명',true);
+    }
+
+    if(msg.type==='players'){
+      const seen=new Set();
+
+      for(const data of msg.players){
+        if(data.id===onlinePlayerId)continue;
+        seen.add(data.id);
+
+        let p=onlinePlayers.get(data.id);
+        if(!p){
+          p=createRemotePlayer(data);
+          onlinePlayers.set(data.id,p);
+        }
+
+        if(p.carType!==data.carType){
+          const oldPos=p.model.position.clone();
+          const oldRot=p.model.rotation.y;
+          if(p.model.parent)p.model.parent.remove(p.model);
+          p=createRemotePlayer({...data,x:oldPos.x,z:oldPos.z,ry:oldRot});
+          onlinePlayers.set(data.id,p);
+        }
+
+        p.targetX=data.x||0;
+        p.targetZ=data.z||0;
+        p.targetRY=data.ry||0;
+        p.nickname=data.nickname||'플레이어';
+      }
+
+      for(const id of [...onlinePlayers.keys()]){
+        if(!seen.has(id))removeRemotePlayer(id);
+      }
+
+      onlineStatus('접속됨 · '+msg.players.length+'명',true);
+    }
+
+    if(msg.type==='error'){
+      onlineStatus(msg.message||'서버 오류');
+    }
+  });
+
+  onlineSocket.addEventListener('close',()=>{
+    onlineConnected=false;
+    onlineStatus('연결 끊김');
+    for(const id of [...onlinePlayers.keys()])removeRemotePlayer(id);
+    setTimeout(()=>{
+      if(gameStarted)connectOnlineServer();
+    },2500);
+  });
+
+  onlineSocket.addEventListener('error',()=>{
+    onlineConnected=false;
+    onlineStatus('연결 오류');
+  });
+}
+
 let gameStarted=false;
 const nicknameInput=document.getElementById('nicknameInput');
 const playerNickname=document.getElementById('playerNickname');
@@ -3125,6 +3310,7 @@ startButton.addEventListener('click',()=>{
   updatePlayerNameTag(nickname);
   gameStarted=true;
   startScreen.style.display='none';
+  connectOnlineServer();
 });
 
 nicknameInput.addEventListener('keydown',e=>{
